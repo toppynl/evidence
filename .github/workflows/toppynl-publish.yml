@@ -1,0 +1,113 @@
+name: Toppy — version & publish
+
+# Fork-only release pipeline. Upstream's release.yml is guarded on
+# `github.repository == 'evidence-dev/evidence'` and never fires here, so the two
+# do not collide.
+#
+# Two halves, both driven by the changesets setup that already lives in the repo:
+#
+#   version  — on push to main, changesets opens/updates a "Version Packages" PR
+#              that consumes .changeset/*.md, bumps versions and writes changelogs.
+#              Merge it when you want a release.
+#   publish  — on a `toppynl-v*` tag (or manual dispatch), build, rewrite the five
+#              published package.json's into the @toppynl scope, and push them to
+#              GitHub Packages.
+#
+# Auth is the built-in GITHUB_TOKEN; npm.pkg.github.com accepts it for packages
+# owned by this repository. No new secrets.
+
+on:
+  push:
+    branches: [main]
+    tags: ['toppynl-v*']
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Pack only, do not publish'
+        type: boolean
+        default: true
+
+concurrency:
+  group: toppynl-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  version:
+    name: Version PR
+    if: github.repository == 'toppynl/evidence' && github.event_name == 'push' && startsWith(github.ref, 'refs/heads/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: pnpm/action-setup@v4.0.0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - uses: changesets/action@v1
+        with:
+          version: pnpm changeset version
+          commit: 'chore: version packages'
+          title: 'chore: version packages'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  publish:
+    name: Publish to GitHub Packages
+    if: github.repository == 'toppynl/evidence' && (startsWith(github.ref, 'refs/tags/toppynl-v') || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: pnpm/action-setup@v4.0.0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+
+      # postinstall builds preprocess, tailwind, core-components and evidence,
+      # which is everything the published packages need.
+      - run: pnpm install --frozen-lockfile
+
+      - name: Point the @toppynl scope at GitHub Packages
+        env:
+          GH_PACKAGES_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          {
+            echo "@toppynl:registry=https://npm.pkg.github.com/"
+            echo "//npm.pkg.github.com/:_authToken=${GH_PACKAGES_TOKEN}"
+          } >> .npmrc
+
+      - name: Rewrite package.json's into the @toppynl scope
+        run: node scripts/toppynl-rescope.mjs
+
+      - name: Pack (dry run)
+        if: github.event_name == 'workflow_dispatch' && inputs.dry_run
+        run: |
+          set -euo pipefail
+          for dir in packages/lib/sdk packages/lib/component-utilities packages/ui/core-components packages/datasources/bigquery packages/evidence; do
+            echo "::group::$dir"
+            (cd "$dir" && pnpm pack --pack-destination "$RUNNER_TEMP")
+            echo "::endgroup::"
+          done
+          ls -la "$RUNNER_TEMP"
+
+      - name: Publish
+        if: "!(github.event_name == 'workflow_dispatch' && inputs.dry_run)"
+        run: |
+          set -euo pipefail
+          # Dependency order: everything below depends on what came before it.
+          for dir in packages/lib/sdk packages/lib/component-utilities packages/ui/core-components packages/datasources/bigquery packages/evidence; do
+            echo "::group::publish $dir"
+            (cd "$dir" && pnpm publish --no-git-checks --access restricted)
+            echo "::endgroup::"
+          done
